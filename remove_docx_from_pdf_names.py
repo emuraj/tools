@@ -1,13 +1,15 @@
-# remove_docx_from_pdf_names.py
+# remove_source_extensions_from_pdf_names.py
 """
-Rename PDF files that mistakenly include '.docx' before '.pdf'.
+Rename PDF files that mistakenly include a source-file extension before '.pdf'.
 
-Example:
+Examples:
     "report.docx.pdf" -> "report.pdf"
+    "report.doc.pdf"  -> "report.pdf"
+    "report.xlsx.pdf" -> "report.pdf"
 
 What this file does:
 - Recursively scans a root folder and all subfolders
-- Renames only files ending in '.docx.pdf'
+- Renames PDF files ending with known non-PDF source extensions before '.pdf'
 - Leaves every other file untouched
 
 Place in the larger scheme:
@@ -18,12 +20,28 @@ from pathlib import Path
 
 
 # ===== EDIT THIS =====
-ROOT_FOLDER = r"C:\Users\e.muraj\Desktop\Production\1_TrackWise Raw Export Repository\TrackWise Raw DMS Export"
+ROOT_FOLDER = r"D:\laptop software\Production\1_TrackWise Raw Export Repository\TrackWise Raw DMS Export"
 DRY_RUN = False   # True = preview only, False = actually rename files
 # =====================
 
 
-def remove_docx_from_pdf_names(root_folder: str, dry_run: bool = True) -> None:
+SOURCE_EXTENSIONS = {
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".rtf",
+    ".txt",
+    ".csv",
+    ".odt",
+    ".ods",
+    ".odp",
+}
+
+
+def remove_source_extensions_from_pdf_names(root_folder: str, dry_run: bool = True) -> None:
     root = Path(root_folder)
 
     if not root.exists():
@@ -37,24 +55,32 @@ def remove_docx_from_pdf_names(root_folder: str, dry_run: bool = True) -> None:
         if not path.is_file():
             continue
 
-        if path.name.endswith(".docx.pdf"):
-            new_name = path.name[:-9] + ".pdf"
-            new_path = path.with_name(new_name)
+        if path.suffix.lower() != ".pdf":
+            continue
 
-            if new_path.exists():
-                print(f"SKIP (target exists): {path} -> {new_path}")
-                continue
+        pdf_stem = Path(path.stem)
+        source_extension = pdf_stem.suffix.lower()
 
-            print(f"RENAME: {path} -> {new_path}")
+        if source_extension not in SOURCE_EXTENSIONS:
+            continue
 
-            if not dry_run:
-                path.rename(new_path)
+        new_name = pdf_stem.stem + ".pdf"
+        new_path = path.with_name(new_name)
 
-            renamed_count += 1
+        if new_path.exists():
+            print(f"SKIP (target exists): {path} -> {new_path}")
+            continue
+
+        print(f"RENAME: {path} -> {new_path}")
+
+        if not dry_run:
+            path.rename(new_path)
+
+        renamed_count += 1
 
     mode = "DRY RUN" if dry_run else "DONE"
     print(f"\n{mode}: {renamed_count} file(s) matched.")
 
 
 if __name__ == "__main__":
-    remove_docx_from_pdf_names(ROOT_FOLDER, dry_run=DRY_RUN)
+    remove_source_extensions_from_pdf_names(ROOT_FOLDER, dry_run=DRY_RUN)
