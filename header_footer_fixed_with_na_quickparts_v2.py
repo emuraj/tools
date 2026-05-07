@@ -13,13 +13,15 @@ What this file does:
     - Makes a working copy of each input document before editing.
     - Optionally backs up original files.
     - Clears read-only/final/read-only-recommended state where possible.
-    - Normalizes header/footer paragraph formatting.
-    - Centers header/footer tables.
+    - Normalizes header/footer paragraph spacing.
+    - Centers header/footer tables as table objects.
+    - Formats header table cell contents as Arial 11, left justified, except GxP cells,
+      which are centered.
+    - Formats footer table cell contents as Arial 9, center justified.
     - Deletes extra blank paragraphs after header/footer tables.
     - Deletes extra blank paragraphs after the Neurotech footer phrase.
-    - Fills blank adjacent value cells with "N/A" for these footer-table labels:
+    - Fills blank cells directly below these footer-table labels with "N/A":
         Batch ID
-        Version #
         Printed Time
         Printed Date
         Printed By
@@ -114,6 +116,7 @@ wdHeaderFooterPrimary = 1
 wdHeaderFooterFirstPage = 2
 wdHeaderFooterEvenPages = 3
 
+wdAlignParagraphLeft = 0
 wdAlignParagraphCenter = 1
 wdLineSpaceSingle = 0
 wdAlertsNone = 0
@@ -167,6 +170,7 @@ class RunStats:
     text_shapes_formatted_total: int = 0
     format_apps_total: int = 0
     quickparts_na_filled_total: int = 0
+    table_cells_formatted_total: int = 0
 
     protections_enabled: bool = False
     protection_password: str = ""
@@ -317,6 +321,19 @@ def _cell_text(cell) -> str:
         return ""
 
 
+def _cell_visible_text(cell) -> str:
+    try:
+        text = str(cell.Range.Text or "")
+    except Exception:
+        return ""
+
+    text = text.replace("\r", "")
+    text = text.replace("\x07", "")
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
 def _normalize_key_text(text: str) -> str:
     text = (text or "").lower()
     text = text.replace("\r", "").replace("\x07", "")
@@ -328,6 +345,13 @@ def _normalize_key_text(text: str) -> str:
 # Word formatting helpers
 # -----------------------------
 def apply_paragraph_format_to_range(rng) -> int:
+    """
+    General header/footer range normalization.
+
+    This keeps the existing broad behavior. More specific table-cell rules are applied
+    later so header cell contents become Arial 11 left, GxP cell centered, and footer
+    cell contents become Arial 9 centered.
+    """
     pf = rng.ParagraphFormat
     pf.SpaceBefore = 0
     pf.SpaceAfter = 0
@@ -383,6 +407,13 @@ def apply_paragraph_format_to_shapes_in_headerfooter(hf) -> tuple[int, int, int]
 
 
 def center_tables_in_range(rng) -> tuple[int, int]:
+    """
+    Center the table object/rows in the header/footer range.
+
+    This does not determine the final alignment of text inside table cells. Header/footer
+    cell-content alignment is enforced separately by format_header_table_cells() and
+    format_footer_table_cells().
+    """
     tables_found = 0
     centered = 0
 
@@ -413,6 +444,142 @@ def center_tables_in_range(rng) -> tuple[int, int]:
         return tables_found, centered
 
     return tables_found, centered
+
+
+def _apply_font_and_alignment_to_cell(cell, *, font_name: str, font_size: int, alignment: int) -> bool:
+    """
+    Format only the contents of a table cell.
+
+    This does not left-align the table object itself. It changes the font and paragraph
+    alignment inside the cell range.
+    """
+    try:
+        rng = cell.Range
+
+        try:
+            rng.Font.Name = font_name
+        except Exception:
+            pass
+
+        try:
+            rng.Font.NameAscii = font_name
+        except Exception:
+            pass
+
+        try:
+            rng.Font.NameOther = font_name
+        except Exception:
+            pass
+
+        try:
+            rng.Font.Size = font_size
+        except Exception:
+            pass
+
+        pf = rng.ParagraphFormat
+        pf.SpaceBefore = 0
+        pf.SpaceAfter = 0
+
+        try:
+            pf.SpaceBeforeAuto = False
+        except Exception:
+            pass
+
+        try:
+            pf.SpaceAfterAuto = False
+        except Exception:
+            pass
+
+        pf.LineSpacingRule = wdLineSpaceSingle
+        pf.Alignment = alignment
+
+        return True
+    except Exception:
+        return False
+
+
+def format_header_table_cells(hf_range) -> int:
+    """
+    Header table cell-content requirement:
+      - Arial 11
+      - Left justified cell contents
+      - Exception: the cell whose visible text is GxP is center justified
+
+    This does not left-align the header table object itself.
+    """
+    formatted = 0
+
+    try:
+        table_count = int(hf_range.Tables.Count)
+    except Exception:
+        return 0
+
+    for table_idx in range(1, table_count + 1):
+        try:
+            tbl = hf_range.Tables(table_idx)
+            rows = int(tbl.Rows.Count)
+            cols = int(tbl.Columns.Count)
+        except Exception:
+            continue
+
+        for row_idx in range(1, rows + 1):
+            for col_idx in range(1, cols + 1):
+                try:
+                    cell = tbl.Cell(row_idx, col_idx)
+                    visible = _cell_visible_text(cell)
+                except Exception:
+                    continue
+
+                alignment = wdAlignParagraphCenter if visible.strip().lower() == "gxp" else wdAlignParagraphLeft
+
+                if _apply_font_and_alignment_to_cell(
+                    cell,
+                    font_name="Arial",
+                    font_size=11,
+                    alignment=alignment,
+                ):
+                    formatted += 1
+
+    return formatted
+
+
+def format_footer_table_cells(hf_range) -> int:
+    """
+    Footer table cell-content requirement:
+      - Arial 9
+      - Center justified cell contents
+    """
+    formatted = 0
+
+    try:
+        table_count = int(hf_range.Tables.Count)
+    except Exception:
+        return 0
+
+    for table_idx in range(1, table_count + 1):
+        try:
+            tbl = hf_range.Tables(table_idx)
+            rows = int(tbl.Rows.Count)
+            cols = int(tbl.Columns.Count)
+        except Exception:
+            continue
+
+        for row_idx in range(1, rows + 1):
+            for col_idx in range(1, cols + 1):
+                try:
+                    cell = tbl.Cell(row_idx, col_idx)
+                except Exception:
+                    continue
+
+                if _apply_font_and_alignment_to_cell(
+                    cell,
+                    font_name="Arial",
+                    font_size=9,
+                    alignment=wdAlignParagraphCenter,
+                ):
+                    formatted += 1
+
+    return formatted
 
 
 def range_is_empty(hf_range, table_count: int, text_shapes_count: int) -> bool:
@@ -646,8 +813,6 @@ def extract_document_id_from_headers(doc) -> str | None:
 # -----------------------------
 _QUICKPART_NA_TARGETS = {
     "batch id",
-    "version",
-    "version number",
     "printed time",
     "printed date",
     "printed by",
@@ -691,23 +856,11 @@ def _set_cell_text(cell, value: str) -> bool:
         return False
 
 
-def _right_adjacent_cell(tbl, row_idx: int, col_idx: int, label_cell):
+def _cell_below(tbl, row_idx: int, col_idx: int):
     try:
-        cols = int(tbl.Columns.Count)
-        if col_idx < cols:
-            return tbl.Cell(row_idx, col_idx + 1)
-    except Exception:
-        pass
-
-    try:
-        row = tbl.Rows(row_idx)
-        row_cell_count = int(row.Cells.Count)
-        label_start = int(label_cell.Range.Start)
-
-        for idx in range(1, row_cell_count + 1):
-            cc = row.Cells(idx)
-            if int(cc.Range.Start) == label_start and idx < row_cell_count:
-                return row.Cells(idx + 1)
+        rows = int(tbl.Rows.Count)
+        if row_idx < rows:
+            return tbl.Cell(row_idx + 1, col_idx)
     except Exception:
         pass
 
@@ -715,6 +868,16 @@ def _right_adjacent_cell(tbl, row_idx: int, col_idx: int, label_cell):
 
 
 def fill_footer_quickparts_defaults_in_range(hf_range, default_value: str = "N/A") -> int:
+    """
+    Fill blank footer-table value cells below selected QuickPart labels with N/A.
+
+    Expected final footer layout:
+
+        Controlled Print # | Printed Date | Printed Time | Printed By | Batch ID
+        N/A                | N/A          | N/A          | N/A        | N/A
+
+    Existing nonblank values are preserved.
+    """
     filled = 0
 
     try:
@@ -741,7 +904,7 @@ def fill_footer_quickparts_defaults_in_range(hf_range, default_value: str = "N/A
                 if not _quickpart_label_matches(label_text):
                     continue
 
-                value_cell = _right_adjacent_cell(tbl, row_idx, col_idx, label_cell)
+                value_cell = _cell_below(tbl, row_idx, col_idx)
 
                 if value_cell is None:
                     continue
@@ -920,6 +1083,7 @@ def process_headerfooter(
         "tables_centered": 0,
         "text_shapes_formatted": 0,
         "quickparts_na_filled": 0,
+        "table_cells_formatted": 0,
     }
 
     res = {
@@ -931,6 +1095,7 @@ def process_headerfooter(
         "spec_max": 0,
         "tables_centering_applied": "NO",
         "tables_centered_count": 0,
+        "table_cells_formatted": 0,
         "post_table_blanks_found": "N/A",
         "post_table_blank_count": "N/A",
         "post_table_deletions_required": "N/A",
@@ -998,14 +1163,36 @@ def process_headerfooter(
             res["tables_centering_applied"] = "SKIPPED"
             res["tables_centered_count"] = 0
 
+        if mode == "header":
+            if substep:
+                substep("header_table_cell_font_alignment")
+
+            formatted = format_header_table_cells(hf.Range)
+            res["table_cells_formatted"] += int(formatted)
+            agg["table_cells_formatted"] += int(formatted)
+
         if mode == "footer":
             if substep:
-                substep("quickparts_na_defaults")
+                substep("footer_table_cell_font_alignment_before_defaults")
+
+            formatted_before = format_footer_table_cells(hf.Range)
+            res["table_cells_formatted"] += int(formatted_before)
+            agg["table_cells_formatted"] += int(formatted_before)
+
+            if substep:
+                substep("quickparts_na_defaults_below_labels")
 
             filled = fill_footer_quickparts_defaults_in_range(hf.Range, default_value="N/A")
             res["quickparts_na_filled"] = int(filled)
             agg["quickparts_na_filled"] += int(filled)
             actions += int(filled)
+
+            if substep:
+                substep("footer_table_cell_font_alignment_after_defaults")
+
+            formatted_after = format_footer_table_cells(hf.Range)
+            res["table_cells_formatted"] += int(formatted_after)
+            agg["table_cells_formatted"] += int(formatted_after)
 
         if substep:
             substep("range_empty_check")
@@ -1069,6 +1256,7 @@ def process_headers_footers_only(
         "tables_centered": 0,
         "text_shapes_formatted": 0,
         "quickparts_na_filled": 0,
+        "table_cells_formatted": 0,
     }
 
     actions_total = 0
@@ -1082,6 +1270,7 @@ def process_headers_footers_only(
         "tables_centered": 0,
         "text_shapes_formatted": 0,
         "quickparts_na_filled": 0,
+        "table_cells_formatted": 0,
     }
 
     for section_idx in range(1, sec_count + 1):
@@ -1115,6 +1304,7 @@ def process_headers_footers_only(
             aggregates["tables_centered"] += int(hdr_agg.get("tables_centered", 0))
             aggregates["text_shapes_formatted"] += int(hdr_agg.get("text_shapes_formatted", 0))
             aggregates["quickparts_na_filled"] += int(hdr_agg.get("quickparts_na_filled", 0))
+            aggregates["table_cells_formatted"] += int(hdr_agg.get("table_cells_formatted", 0))
 
             try:
                 ftr = sec.Footers(kind)
@@ -1142,6 +1332,7 @@ def process_headers_footers_only(
             aggregates["tables_centered"] += int(ftr_agg.get("tables_centered", 0))
             aggregates["text_shapes_formatted"] += int(ftr_agg.get("text_shapes_formatted", 0))
             aggregates["quickparts_na_filled"] += int(ftr_agg.get("quickparts_na_filled", 0))
+            aggregates["table_cells_formatted"] += int(ftr_agg.get("table_cells_formatted", 0))
 
         details["sections_data"].append(sec_block)
 
@@ -1292,6 +1483,9 @@ def generate_pdf_report(
         ["DocID Naming Enabled", "YES" if stats.docid_naming_enabled else "NO"],
         ["Restrict Headers/Footers Enabled", "YES" if stats.protections_enabled else "NO"],
         ["Restrict Headers/Footers Password", stats.protection_password if stats.protections_enabled else "N/A"],
+        ["Header Table Cell Format", "Arial 11; cell contents left except GxP centered"],
+        ["Footer Table Cell Format", "Arial 9; cell contents centered"],
+        ["Footer N/A Default Layout", "Values inserted in cells below matching labels"],
     ]
 
     meta_tbl = Table(meta_rows, colWidths=[2.4 * inch, 5.1 * inch])
@@ -1321,6 +1515,7 @@ def generate_pdf_report(
         ["Header post-table deletions", str(stats.header_post_table_deleted_total)],
         ["Footer post-table deletions", str(stats.footer_post_table_deleted_total)],
         ["Tables centered", str(stats.tables_centered_total)],
+        ["Table cells formatted", str(stats.table_cells_formatted_total)],
         ["Text shapes formatted", str(stats.text_shapes_formatted_total)],
         ["Format applications", str(stats.format_apps_total)],
         ["QuickParts N/A defaults filled", str(stats.quickparts_na_filled_total)],
@@ -1623,6 +1818,7 @@ class App(tk.Tk):
                 f"Total: {stats.total_files} | Processed: {stats.processed} | "
                 f"OK: {stats.succeeded} | Failed: {stats.failed} | Skipped: {stats.skipped} | "
                 f"Actions: {stats.total_actions} | QuickParts N/A: {stats.quickparts_na_filled_total} | "
+                f"Table cells formatted: {stats.table_cells_formatted_total} | "
                 f"Elapsed: {elapsed:.1f}s{extra}"
             )
         )
@@ -1831,6 +2027,9 @@ class App(tk.Tk):
             f"NAME OUTPUTS BY DOC ID      : {'YES' if name_by_docid else 'NO'}",
             f"RESTRICT HEADERS/FOOTERS    : {'YES' if protect_headers_footers else 'NO'}",
             f"RESTRICTION PASSWORD        : {protection_password if protect_headers_footers else 'N/A'}",
+            f"HEADER CELL FORMAT          : Arial 11; contents left except GxP centered",
+            f"FOOTER CELL FORMAT          : Arial 9; contents centered",
+            f"FOOTER N/A DEFAULT LAYOUT   : Values inserted below matching labels",
             ts_line(),
             "",
         ]
@@ -1978,6 +2177,7 @@ class App(tk.Tk):
                     "tables_centered": 0,
                     "text_shapes_formatted": 0,
                     "quickparts_na_filled": 0,
+                    "table_cells_formatted": 0,
                 }
 
                 doc_id_value: str | None = None
@@ -2171,6 +2371,7 @@ class App(tk.Tk):
                     stats.tables_centered_total += int(aggs.get("tables_centered", 0))
                     stats.text_shapes_formatted_total += int(aggs.get("text_shapes_formatted", 0))
                     stats.quickparts_na_filled_total += int(aggs.get("quickparts_na_filled", 0))
+                    stats.table_cells_formatted_total += int(aggs.get("table_cells_formatted", 0))
 
                     block = []
                     block.append(ts_line())
@@ -2224,9 +2425,10 @@ class App(tk.Tk):
                             block.append(f"  HEADER {kind_name}")
                             block.append(f"    PRESENT                  : {hdr.get('present', 'NO')}")
                             block.append(f"    RANGE EMPTY              : {hdr.get('range_empty', 'UNKNOWN')}")
-                            block.append(f"    FORMAT NORMALIZATION     : APPLIED={hdr.get('format_applied', 'NO')} | TARGET=(Before=0, After=0, Line=Single, Align=Center)")
+                            block.append(f"    FORMAT NORMALIZATION     : APPLIED={hdr.get('format_applied', 'NO')} | TARGET=(Before=0, After=0, Line=Single)")
                             block.append(f"    TABLES FOUND             : {hdr.get('tables_found', 'NO')} | COUNT={hdr.get('table_count', 'UNKNOWN')} | ANCHOR={hdr.get('anchor', 'N/A')}")
                             block.append(f"    TABLE CENTERING          : APPLIED={hdr.get('tables_centering_applied', 'NO')} | CENTERED_COUNT={hdr.get('tables_centered_count', 0)}")
+                            block.append(f"    TABLE CELL FORMAT        : Arial 11; contents left except GxP centered | CELLS_FORMATTED={hdr.get('table_cells_formatted', 0)}")
                             block.append(f"    BLANK CLEANUP METHOD     : {hdr.get('blank_cleanup_method', 'UNKNOWN')}")
                             block.append(f"    POST-TABLE SPEC_MAX      : {hdr.get('spec_max', 'UNKNOWN')}")
                             block.append(f"    POST-TABLE BLANKS FOUND  : {hdr.get('post_table_blanks_found', 'N/A')} | COUNT={hdr.get('post_table_blank_count', 'N/A')}")
@@ -2242,9 +2444,10 @@ class App(tk.Tk):
                             block.append(f"  FOOTER {kind_name}")
                             block.append(f"    PRESENT                  : {ftr.get('present', 'NO')}")
                             block.append(f"    RANGE EMPTY              : {ftr.get('range_empty', 'UNKNOWN')}")
-                            block.append(f"    FORMAT NORMALIZATION     : APPLIED={ftr.get('format_applied', 'NO')} | TARGET=(Before=0, After=0, Line=Single, Align=Center)")
+                            block.append(f"    FORMAT NORMALIZATION     : APPLIED={ftr.get('format_applied', 'NO')} | TARGET=(Before=0, After=0, Line=Single)")
                             block.append(f"    TABLES FOUND             : {ftr.get('tables_found', 'NO')} | COUNT={ftr.get('table_count', 'UNKNOWN')} | ANCHOR={ftr.get('anchor', 'N/A')}")
                             block.append(f"    TABLE CENTERING          : APPLIED={ftr.get('tables_centering_applied', 'NO')} | CENTERED_COUNT={ftr.get('tables_centered_count', 0)}")
+                            block.append(f"    TABLE CELL FORMAT        : Arial 9; contents centered | CELLS_FORMATTED={ftr.get('table_cells_formatted', 0)}")
                             block.append(f"    BLANK CLEANUP METHOD     : {ftr.get('blank_cleanup_method', 'UNKNOWN')}")
                             block.append(f"    POST-TABLE SPEC_MAX      : {ftr.get('spec_max', 'UNKNOWN')}")
                             block.append(f"    POST-TABLE BLANKS FOUND  : {ftr.get('post_table_blanks_found', 'N/A')} | COUNT={ftr.get('post_table_blank_count', 'N/A')}")
@@ -2370,6 +2573,7 @@ class App(tk.Tk):
                 f"HEADER POST-TABLE DELETIONS : {stats.header_post_table_deleted_total}",
                 f"FOOTER POST-TABLE DELETIONS : {stats.footer_post_table_deleted_total}",
                 f"TABLES CENTERED (COUNT)     : {stats.tables_centered_total}",
+                f"TABLE CELLS FORMATTED       : {stats.table_cells_formatted_total}",
                 f"TEXT SHAPES FORMATTED       : {stats.text_shapes_formatted_total}",
                 f"FORMAT APPS (COUNT)         : {stats.format_apps_total}",
                 f"QUICKPARTS N/A FILLED       : {stats.quickparts_na_filled_total}",
