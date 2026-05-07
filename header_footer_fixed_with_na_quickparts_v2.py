@@ -30,7 +30,10 @@ What this file does:
     - Optionally extracts Document ID from header tables and uses it for output naming.
     - Optionally protects the output document so the body is editable by Everyone while
       headers/footers remain restricted, using the password entered in the GUI.
-    - Optionally exports each processed document to PDF.
+    - Periodically restarts Microsoft Word during large batches to prevent COM resource exhaustion.
+    - Retries a failed Word open once after restarting Word.
+    - Restarts Word after any document-level COM/process failure so one poisoned Word instance
+      does not cascade into the remaining documents.
     - Generates a text run log and, when ReportLab is installed, a PDF run report.
 
 Place in the larger scheme:
@@ -171,6 +174,15 @@ class RunStats:
     format_apps_total: int = 0
     quickparts_na_filled_total: int = 0
     table_cells_formatted_total: int = 0
+
+    restart_interval_docs: int = 100
+    word_restarts_attempted: int = 0
+    word_restarts_ok: int = 0
+    word_restarts_failed: int = 0
+    open_retries_attempted: int = 0
+    open_retries_ok: int = 0
+    open_retries_failed: int = 0
+    detailed_pdf_report_enabled: bool = True
 
     protections_enabled: bool = False
     protection_password: str = ""
@@ -1431,6 +1443,7 @@ def generate_pdf_report(
     backup_root: str,
     error_rows: list[tuple[str, str, str]],
     doc_blocks: list[list[str]],
+    include_detail: bool = True,
 ) -> None:
     if SimpleDocTemplate is None or canvas is None or NumberedCanvas is None:
         raise RuntimeError("ReportLab is required for PDF run-report generation. Install it with: pip install reportlab")
@@ -1486,6 +1499,9 @@ def generate_pdf_report(
         ["Header Table Cell Format", "Arial 11; cell contents left except GxP centered"],
         ["Footer Table Cell Format", "Arial 9; cell contents centered"],
         ["Footer N/A Default Layout", "Values inserted in cells below matching labels"],
+        ["Restart Word Every N Docs", str(stats.restart_interval_docs)],
+        ["Open Retry After Word Restart", "YES"],
+        ["Detailed PDF Report", "YES" if stats.detailed_pdf_report_enabled else "NO"],
     ]
 
     meta_tbl = Table(meta_rows, colWidths=[2.4 * inch, 5.1 * inch])
@@ -1516,6 +1532,12 @@ def generate_pdf_report(
         ["Footer post-table deletions", str(stats.footer_post_table_deleted_total)],
         ["Tables centered", str(stats.tables_centered_total)],
         ["Table cells formatted", str(stats.table_cells_formatted_total)],
+        ["Word restarts attempted", str(stats.word_restarts_attempted)],
+        ["Word restarts succeeded", str(stats.word_restarts_ok)],
+        ["Word restarts failed", str(stats.word_restarts_failed)],
+        ["Open retries attempted", str(stats.open_retries_attempted)],
+        ["Open retries succeeded", str(stats.open_retries_ok)],
+        ["Open retries failed", str(stats.open_retries_failed)],
         ["Text shapes formatted", str(stats.text_shapes_formatted_total)],
         ["Format applications", str(stats.format_apps_total)],
         ["QuickParts N/A defaults filled", str(stats.quickparts_na_filled_total)],
@@ -1566,12 +1588,17 @@ def generate_pdf_report(
     else:
         story.append(Paragraph("No errors recorded.", body))
 
-    story.append(PageBreak())
-    story.append(Paragraph("Detailed Event Log", h2))
+    if include_detail:
+        story.append(PageBreak())
+        story.append(Paragraph("Detailed Event Log", h2))
 
-    for block in doc_blocks:
-        story.append(Preformatted("\n".join(_wrap_lines(block, 112)), mono))
-        story.append(Spacer(1, 10))
+        for block in doc_blocks:
+            story.append(Preformatted("\n".join(_wrap_lines(block, 112)), mono))
+            story.append(Spacer(1, 10))
+    else:
+        story.append(Spacer(1, 12))
+        story.append(Paragraph("Detailed Event Log", h2))
+        story.append(Paragraph("Detailed per-document report content was disabled for this run. The complete text log was still written to disk.", body))
 
     def canvas_maker(filename, **kwargs):
         return NumberedCanvas(
@@ -1729,6 +1756,17 @@ class App(tk.Tk):
         )
         self.protection_password_entry.grid(row=1, column=4, sticky="w", padx=10, pady=4)
 
+        ttk.Label(opt_frame, text="Restart Word every N docs:").grid(row=2, column=0, sticky="e", padx=(10, 6), pady=4)
+        self.restart_interval_var = tk.StringVar(value="100")
+        ttk.Entry(opt_frame, textvariable=self.restart_interval_var, width=8).grid(row=2, column=1, sticky="w", padx=10, pady=4)
+
+        self.detailed_pdf_report_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            opt_frame,
+            text="Include detailed per-document PDF report",
+            variable=self.detailed_pdf_report_var,
+        ).grid(row=2, column=3, columnspan=2, sticky="w", padx=10, pady=4)
+
         for col in range(5):
             opt_frame.columnconfigure(col, weight=0)
 
@@ -1844,6 +1882,15 @@ class App(tk.Tk):
         name_by_docid = bool(self.name_by_docid_var.get())
         protect_headers_footers = bool(self.protect_headers_footers_var.get())
         protection_password = self.protection_password_var.get().strip()
+        detailed_pdf_report_enabled = bool(self.detailed_pdf_report_var.get())
+
+        try:
+            restart_interval_docs = int(self.restart_interval_var.get().strip())
+            if restart_interval_docs < 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("Invalid restart interval", "Restart Word every N docs must be an integer >= 0. Use 0 to disable periodic restarts.")
+            return
 
         if not in_dir or not os.path.isdir(in_dir):
             messagebox.showerror("Invalid input", "Please select a valid input folder.")
@@ -1891,6 +1938,8 @@ class App(tk.Tk):
             backups_enabled=backups_enabled,
             pdf_exports_enabled=export_pdf_each,
             docid_naming_enabled=name_by_docid,
+            restart_interval_docs=restart_interval_docs,
+            detailed_pdf_report_enabled=detailed_pdf_report_enabled,
             protections_enabled=protect_headers_footers,
             protection_password=protection_password if protect_headers_footers else "",
             user=user,
@@ -1923,6 +1972,8 @@ class App(tk.Tk):
                 name_by_docid,
                 protect_headers_footers,
                 protection_password,
+                restart_interval_docs,
+                detailed_pdf_report_enabled,
             ),
             daemon=True,
         )
@@ -1985,6 +2036,8 @@ class App(tk.Tk):
         name_by_docid: bool,
         protect_headers_footers: bool,
         protection_password: str,
+        restart_interval_docs: int,
+        detailed_pdf_report_enabled: bool,
     ):
         assert self._stats is not None
         stats = self._stats
@@ -2030,6 +2083,9 @@ class App(tk.Tk):
             f"HEADER CELL FORMAT          : Arial 11; contents left except GxP centered",
             f"FOOTER CELL FORMAT          : Arial 9; contents centered",
             f"FOOTER N/A DEFAULT LAYOUT   : Values inserted below matching labels",
+            f"RESTART WORD EVERY N DOCS   : {restart_interval_docs}",
+            f"OPEN RETRY AFTER RESTART    : YES",
+            f"DETAILED PDF REPORT         : {'YES' if detailed_pdf_report_enabled else 'NO'}",
             ts_line(),
             "",
         ]
@@ -2111,6 +2167,66 @@ class App(tk.Tk):
             except Exception:
                 pass
 
+        def restart_word(reason: str) -> None:
+            nonlocal word
+            stats.word_restarts_attempted += 1
+            self._emit(f"STEP: Restart Word (start) | reason={reason}")
+
+            try:
+                if word is not None:
+                    stop_word(word)
+            except Exception:
+                pass
+
+            word, new_pid = start_word()
+            self._set_word_pid(new_pid if new_pid else None)
+
+            if word is None:
+                stats.word_restarts_failed += 1
+                self._emit("STEP: Restart Word (FAIL)")
+                raise RuntimeError("Word restart failed.")
+
+            try:
+                stats.word_version = str(word.Version)
+            except Exception:
+                pass
+
+            stats.word_restarts_ok += 1
+            self._emit(f"STEP: Restart Word (done) | pid={new_pid if new_pid else 'UNKNOWN'}")
+
+        def open_document_with_retry(work_abs_path: str, file_label_for_log: str):
+            nonlocal word
+
+            try:
+                return word.Documents.Open(
+                    work_abs_path,
+                    ReadOnly=False,
+                    AddToRecentFiles=False,
+                    Visible=False,
+                    ConfirmConversions=False,
+                )
+            except Exception as first_exc:
+                stats.open_retries_attempted += 1
+                self._emit(f"STEP: Word OPEN retry triggered | file={file_label_for_log} | first_error={first_exc}")
+
+                restart_word(f"retry open after Word OPEN failure for {file_label_for_log}")
+
+                try:
+                    retried_doc = word.Documents.Open(
+                        work_abs_path,
+                        ReadOnly=False,
+                        AddToRecentFiles=False,
+                        Visible=False,
+                        ConfirmConversions=False,
+                    )
+                    stats.open_retries_ok += 1
+                    self._emit(f"STEP: Word OPEN retry (done) | file={file_label_for_log}")
+                    return retried_doc
+                except Exception as retry_exc:
+                    stats.open_retries_failed += 1
+                    self._emit(f"STEP: Word OPEN retry (FAIL) | file={file_label_for_log} | retry_error={retry_exc}")
+                    raise retry_exc from first_exc
+
         try:
             word, pid = start_word()
             self._set_word_pid(pid if pid else None)
@@ -2126,6 +2242,9 @@ class App(tk.Tk):
             for idx, (abs_path, rel_path) in enumerate(files, start=1):
                 if self._stop_event.is_set():
                     break
+
+                if restart_interval_docs > 0 and idx > 1 and (idx - 1) % restart_interval_docs == 0:
+                    restart_word(f"periodic restart before file index {idx}")
 
                 file_label = os.path.basename(rel_path)
                 abs_in = os.path.abspath(abs_path)
@@ -2194,13 +2313,7 @@ class App(tk.Tk):
                     self._set_status(file_label, "Word OPEN")
                     self._emit("STEP: Word OPEN (start)")
 
-                    doc = word.Documents.Open(
-                        work_abs,
-                        ReadOnly=False,
-                        AddToRecentFiles=False,
-                        Visible=False,
-                        ConfirmConversions=False,
-                    )
+                    doc = open_document_with_retry(work_abs, file_label)
 
                     self._emit("STEP: Word OPEN (done)")
 
@@ -2484,16 +2597,7 @@ class App(tk.Tk):
 
                     doc = None
 
-                    try:
-                        stop_word(word)
-                    except Exception:
-                        pass
-
-                    word, pid = start_word()
-                    self._set_word_pid(pid if pid else None)
-
-                    if word is None:
-                        raise RuntimeError("Word restart failed after timeout.")
+                    restart_word(f"after timeout while processing {file_label}")
 
                 except Exception as exc:
                     stats.failed += 1
@@ -2508,6 +2612,11 @@ class App(tk.Tk):
                         pass
 
                     doc = None
+
+                    try:
+                        restart_word(f"after document failure for {file_label}")
+                    except Exception as restart_exc:
+                        self._emit(f"ERROR: Word restart after failure also failed: {restart_exc}")
 
                 finally:
                     self.after(0, self._update_stats_line)
@@ -2534,6 +2643,7 @@ class App(tk.Tk):
                     backup_root=backup_run_root,
                     error_rows=error_rows,
                     doc_blocks=doc_blocks,
+                    include_detail=detailed_pdf_report_enabled,
                 )
                 self._enqueue_lines(["", f"PDF REPORT WRITTEN            : {pdf_path}", f"TEXT LOG WRITTEN              : {txt_path}", ""])
             except Exception as exc:
@@ -2574,6 +2684,14 @@ class App(tk.Tk):
                 f"FOOTER POST-TABLE DELETIONS : {stats.footer_post_table_deleted_total}",
                 f"TABLES CENTERED (COUNT)     : {stats.tables_centered_total}",
                 f"TABLE CELLS FORMATTED       : {stats.table_cells_formatted_total}",
+                f"RESTART WORD EVERY N DOCS   : {restart_interval_docs}",
+                f"WORD RESTARTS ATTEMPTED     : {stats.word_restarts_attempted}",
+                f"WORD RESTARTS OK            : {stats.word_restarts_ok}",
+                f"WORD RESTARTS FAILED        : {stats.word_restarts_failed}",
+                f"OPEN RETRIES ATTEMPTED      : {stats.open_retries_attempted}",
+                f"OPEN RETRIES OK             : {stats.open_retries_ok}",
+                f"OPEN RETRIES FAILED         : {stats.open_retries_failed}",
+                f"DETAILED PDF REPORT         : {'YES' if detailed_pdf_report_enabled else 'NO'}",
                 f"TEXT SHAPES FORMATTED       : {stats.text_shapes_formatted_total}",
                 f"FORMAT APPS (COUNT)         : {stats.format_apps_total}",
                 f"QUICKPARTS N/A FILLED       : {stats.quickparts_na_filled_total}",
